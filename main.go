@@ -63,18 +63,15 @@ func main() {
 
 func initDB() error {
 	schema := `
-	DROP TABLE IF EXISTS orders CASCADE;
-	DROP TABLE IF EXISTS products CASCADE;
-
-	CREATE TABLE products (
+	CREATE TABLE IF NOT EXISTS products (
 		id SERIAL PRIMARY KEY,
 		name TEXT,
 		stock INT
 	);
 
-	CREATE INDEX idx_products_id ON products(id);
+	CREATE INDEX IF NOT EXISTS idx_products_id ON products(id);
 
-	CREATE TABLE orders (
+	CREATE TABLE IF NOT EXISTS orders (
 		id BIGINT PRIMARY KEY,
 		product_id INT,
 		quantity INT,
@@ -86,11 +83,17 @@ func initDB() error {
 		return err
 	}
 
-	// Seed 10 products: 9 with 1000 stock, 1 HOT SKU with 100 stock
+	// Seed 10 products (only if they don't exist)
 	for i := 1; i <= 10; i++ {
+		var exists bool
+		db.QueryRow("SELECT EXISTS(SELECT 1 FROM products WHERE id = $1)", i).Scan(&exists)
+		if exists {
+			continue
+		}
+
 		stock := 1000
 		if i == 1 {
-			stock = 100 // Hot SKU - will create contention
+			stock = 1000000 // Hot SKU - set high to see lock contention
 		}
 		_, err := db.Exec("INSERT INTO products (id, name, stock) VALUES ($1, $2, $3)", i, fmt.Sprintf("Product %d", i), stock)
 		if err != nil {
