@@ -1,0 +1,12 @@
+flashsale
+flashsale.exe
+*.o
+*.a
+*.so
+.DS_Store
+*.log
+__pycache__
+.venv
+dist/
+.env
+.env.local
