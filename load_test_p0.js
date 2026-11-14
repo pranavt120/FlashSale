@@ -1,14 +1,13 @@
 import http from 'k6/http';
-import { check, sleep, group } from 'k6';
+import { check, sleep } from 'k6';
 
 export const options = {
   stages: [
-    { duration: '30s', target: 100 },   // Ramp up
-    { duration: '1m', target: 100 },    // Stay at 100
-    { duration: '30s', target: 0 },     // Ramp down
+    { duration: '10s', target: 50 },    // Ramp to 50 VUs
+    { duration: '30s', target: 50 },    // Hold 30s
+    { duration: '10s', target: 0 },     // Ramp down
   ],
   thresholds: {
-    http_req_duration: ['p(95)<500', 'p(99)<1000'],
     http_req_failed: ['rate<0.1'],
   },
 };
@@ -16,42 +15,16 @@ export const options = {
 export default function () {
   const baseURL = 'http://localhost:8080';
 
-  group('Catalog Reads', () => {
-    const productId = Math.floor(Math.random() * 10) + 1;
-    const res = http.get(`${baseURL}/catalog/product?id=${productId}`);
-    check(res, {
-      'status is 200': (r) => r.status === 200,
-      'response time < 100ms': (r) => r.timings.duration < 100,
-    });
-  });
+  // 70% reads, 30% writes (realistic flash sale)
+  if (Math.random() < 0.7) {
+    // Read product stock
+    const res = http.get(`${baseURL}/product?id=1`);
+    check(res, { 'read ok': r => r.status === 200 });
+  } else {
+    // Try to buy product 1 (hot SKU - creates lock contention)
+    const res = http.get(`${baseURL}/order?id=1`);
+    check(res, { 'order ok': r => r.status === 200 || r.status === 409 });
+  }
 
-  sleep(0.1);
-
-  group('Create Orders', () => {
-    const productId = Math.floor(Math.random() * 10) + 1;
-    const userId = Math.floor(Math.random() * 100000);
-    const payload = JSON.stringify({
-      user_id: userId,
-      product_id: productId,
-      quantity: 1,
-    });
-
-    const res = http.post(`${baseURL}/orders`, payload, {
-      headers: { 'Content-Type': 'application/json' },
-    });
-
-    check(res, {
-      'status is 200': (r) => r.status === 200 || r.status === 409,
-      'response time < 500ms': (r) => r.timings.duration < 500,
-    });
-  });
-
-  sleep(0.1);
-
-  group('Metrics', () => {
-    const res = http.get(`${baseURL}/metrics`);
-    check(res, {
-      'metrics available': (r) => r.status === 200,
-    });
-  });
+  sleep(0.05); // 20 req/sec per user
 }

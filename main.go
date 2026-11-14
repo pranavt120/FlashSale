@@ -3,336 +3,256 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
-	"os"
-	"os/signal"
-	"strconv"
-	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	_ "github.com/lib/pq"
-	"github.com/redis/go-redis/v9"
 )
 
-var (
-	db *sql.DB
-	rc *redis.Client
+var db *sql.DB
 
-	// Metrics
-	readCount    uint64
-	writeCount   uint64
-	cacheHits    uint64
-	cacheMisses  uint64
-	latencyBuckets = [10]uint64{} // 0, 1, 10, 50, 100, 500, 1000, 5000ms, 10000ms, inf
-)
+type Metrics struct {
+	// Reads
+	readOps     uint64
+	readLatency [5]uint64 // <10ms, <50ms, <100ms, <500ms, >=500ms
 
-func init() {
-	log.SetOutput(os.Stdout)
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	// Writes
+	writeOps     uint64
+	writeLatency [5]uint64
 }
 
-func main() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+var metrics Metrics
 
+func main() {
 	// Connect to Postgres
-	psqlconn := "user=postgres password=postgres dbname=flashsale host=localhost port=5432 sslmode=disable"
+	dsn := "user=postgres password=postgres dbname=flashsale host=localhost port=5432 sslmode=disable"
 	var err error
-	db, err = sql.Open("postgres", psqlconn)
+	db, err = sql.Open("postgres", dsn)
 	if err != nil {
-		log.Fatalf("Failed to connect to Postgres: %v", err)
+		log.Fatalf("Open failed: %v", err)
 	}
 	defer db.Close()
 
-	db.SetMaxOpenConns(100)
-	db.SetMaxIdleConns(10)
+	// Connection pool tuning - this is the FIRST bottleneck you'll hit
+	db.SetMaxOpenConns(50)  // Experiment: try 10, then 100, see latency change
+	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(time.Minute)
 
-	// Test connection
-	if err := db.PingContext(ctx); err != nil {
-		log.Fatalf("Postgres ping failed: %v", err)
+	if err := db.Ping(); err != nil {
+		log.Fatalf("Ping failed: %v", err)
 	}
-	log.Println("✓ Connected to Postgres")
 
-	// Connect to Redis
-	rc = redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: "",
-		DB:       0,
-	})
-	if err := rc.Ping(ctx).Err(); err != nil {
-		log.Fatalf("Redis ping failed: %v", err)
+	// Initialize schema + seed data
+	if err := initDB(); err != nil {
+		log.Fatalf("Init failed: %v", err)
 	}
-	log.Println("✓ Connected to Redis")
+	log.Printf("✓ DB ready (pool: max_open=50, max_idle=5)")
 
-	// Initialize schema
-	if err := initSchema(ctx); err != nil {
-		log.Fatalf("Failed to initialize schema: %v", err)
-	}
-	log.Println("✓ Schema initialized")
+	// Handlers
+	http.HandleFunc("/product", handleProduct)      // Read one product
+	http.HandleFunc("/order", handleOrder)          // Write one order (locks inventory)
+	http.HandleFunc("/metrics", handleMetrics)      // Live metrics
+	http.HandleFunc("/", handleHealth)
 
-	// HTTP handlers
-	http.HandleFunc("/catalog/product", handleGetProduct)
-	http.HandleFunc("/orders", handleCreateOrder)
-	http.HandleFunc("/metrics", handleMetrics)
-	http.HandleFunc("/health", handleHealth)
-
-	// Start server
-	go func() {
-		log.Println("Starting server on :8080")
-		if err := http.ListenAndServe(":8080", nil); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Server error: %v", err)
-		}
-	}()
-
-	// Graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
-	log.Println("Shutting down...")
-	cancel()
+	log.Println("Starting on :8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-func initSchema(ctx context.Context) error {
+func initDB() error {
 	schema := `
-	CREATE TABLE IF NOT EXISTS products (
+	DROP TABLE IF EXISTS orders CASCADE;
+	DROP TABLE IF EXISTS products CASCADE;
+
+	CREATE TABLE products (
 		id SERIAL PRIMARY KEY,
-		name TEXT NOT NULL,
-		stock INT NOT NULL,
-		price INT NOT NULL
+		name TEXT,
+		stock INT
 	);
 
-	CREATE INDEX IF NOT EXISTS idx_products_id ON products(id);
+	CREATE INDEX idx_products_id ON products(id);
 
-	CREATE TABLE IF NOT EXISTS orders (
+	CREATE TABLE orders (
 		id BIGINT PRIMARY KEY,
-		user_id INT NOT NULL,
-		product_id INT NOT NULL,
-		quantity INT NOT NULL,
-		created_at TIMESTAMP DEFAULT NOW(),
-		user_id_shard INT NOT NULL
+		product_id INT,
+		quantity INT,
+		created_at TIMESTAMP DEFAULT NOW()
 	);
-
-	CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
-	CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at DESC);
 	`
 
-	if _, err := db.ExecContext(ctx, schema); err != nil {
+	if _, err := db.Exec(schema); err != nil {
 		return err
 	}
 
-	// Seed products
-	_, err := db.ExecContext(ctx, `
-	DELETE FROM orders;
-	DELETE FROM products;
-	INSERT INTO products (name, stock, price) VALUES
-	('GPU RTX 4090', 100, 160000),
-	('CPU i9-14900K', 50, 75000),
-	('Laptop Gaming', 30, 150000),
-	('Monitor 4K', 200, 50000),
-	('Keyboard Mech', 500, 15000),
-	('Mouse Razer', 1000, 5000),
-	('Headphones', 300, 25000),
-	('SSD 2TB', 200, 30000),
-	('RAM 64GB', 100, 60000),
-	('PSU 1000W', 80, 20000)
-	ON CONFLICT DO NOTHING;
-	`)
-	return err
+	// Seed 10 products: 9 with 1000 stock, 1 HOT SKU with 100 stock
+	for i := 1; i <= 10; i++ {
+		stock := 1000
+		if i == 1 {
+			stock = 100 // Hot SKU - will create contention
+		}
+		_, err := db.Exec("INSERT INTO products (id, name, stock) VALUES ($1, $2, $3)", i, fmt.Sprintf("Product %d", i), stock)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
-func handleGetProduct(w http.ResponseWriter, r *http.Request) {
+// Read a product (no cache)
+func handleProduct(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	defer recordLatency(time.Since(start))
 
-	productIDStr := r.URL.Query().Get("id")
-	if productIDStr == "" {
-		http.Error(w, "Missing id", http.StatusBadRequest)
-		return
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		id = "1" // Default to hot SKU
 	}
 
-	productID, err := strconv.Atoi(productIDStr)
-	if err != nil {
-		http.Error(w, "Invalid id", http.StatusBadRequest)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(r.Context(), time.Second)
 	defer cancel()
 
-	// Try cache first
-	cacheKey := fmt.Sprintf("product:%d", productID)
-	cachedVal, err := rc.Get(ctx, cacheKey).Result()
-	if err == nil {
-		atomic.AddUint64(&cacheHits, 1)
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(cachedVal))
-		return
-	}
-
-	atomic.AddUint64(&cacheMisses, 1)
-
-	// Cache miss: hit DB
-	var product struct {
-		ID    int    `json:"id"`
-		Name  string `json:"name"`
-		Stock int    `json:"stock"`
-		Price int    `json:"price"`
-	}
-
-	err = db.QueryRowContext(ctx, "SELECT id, name, stock, price FROM products WHERE id = $1", productID).
-		Scan(&product.ID, &product.Name, &product.Stock, &product.Price)
-
-	if err == sql.ErrNoRows {
-		http.Error(w, "Not found", http.StatusNotFound)
-		return
-	}
+	var stock int
+	err := db.QueryRowContext(ctx, "SELECT stock FROM products WHERE id = $1", id).Scan(&stock)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("DB error: %v", err), http.StatusInternalServerError)
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
-	// Cache for 60 seconds
-	data, _ := json.Marshal(product)
-	rc.Set(ctx, cacheKey, string(data), 60*time.Second)
-
-	atomic.AddUint64(&readCount, 1)
+	recordRead(time.Since(start))
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(product)
+	fmt.Fprintf(w, `{"id":%s,"stock":%d}`, id, stock)
 }
 
-func handleCreateOrder(w http.ResponseWriter, r *http.Request) {
+// Write an order with inventory lock (FOR UPDATE)
+// This is where you'll see lock contention at high load
+func handleOrder(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	defer recordLatency(time.Since(start))
 
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req struct {
-		UserID    int `json:"user_id"`
-		ProductID int `json:"product_id"`
-		Quantity  int `json:"quantity"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request", http.StatusBadRequest)
-		return
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		id = "1" // Default hits hot SKU
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
 
-	// Simple INSERT + UPDATE in one transaction
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		http.Error(w, "Transaction failed", http.StatusInternalServerError)
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 	defer tx.Rollback()
 
-	// Check and update stock
+	// FOR UPDATE locks the row: only one transaction can hold this lock
+	// At 1000 RPS, all threads queue here waiting for the lock
 	var currentStock int
-	err = tx.QueryRowContext(ctx, "SELECT stock FROM products WHERE id = $1 FOR UPDATE", req.ProductID).
-		Scan(&currentStock)
+	err = tx.QueryRowContext(ctx, "SELECT stock FROM products WHERE id = $1 FOR UPDATE", id).Scan(&currentStock)
 	if err != nil {
-		http.Error(w, "Product not found", http.StatusNotFound)
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
-	if currentStock < req.Quantity {
-		http.Error(w, "Insufficient stock", http.StatusConflict)
+	if currentStock <= 0 {
+		w.WriteHeader(http.StatusConflict)
+		fmt.Fprint(w, `{"error":"out of stock"}`)
+		tx.Rollback()
+		recordWrite(time.Since(start))
 		return
 	}
 
-	_, err = tx.ExecContext(ctx, "UPDATE products SET stock = stock - $1 WHERE id = $2", req.Quantity, req.ProductID)
+	// Decrease stock
+	_, err = tx.ExecContext(ctx, "UPDATE products SET stock = stock - 1 WHERE id = $1", id)
 	if err != nil {
-		http.Error(w, "Failed to update stock", http.StatusInternalServerError)
+		w.WriteHeader(http.StatusInternalServerError)
+		tx.Rollback()
+		recordWrite(time.Since(start))
 		return
 	}
 
-	// Insert order (simplified ID generation)
+	// Insert order
 	orderID := time.Now().UnixNano()
-	_, err = tx.ExecContext(ctx, `
-	INSERT INTO orders (id, user_id, product_id, quantity, user_id_shard)
-	VALUES ($1, $2, $3, $4, $5)
-	`, orderID, req.UserID, req.ProductID, req.Quantity, req.UserID%1024)
-
+	_, err = tx.ExecContext(ctx, "INSERT INTO orders (id, product_id, quantity) VALUES ($1, $2, 1)", orderID, id)
 	if err != nil {
-		http.Error(w, "Failed to create order", http.StatusInternalServerError)
+		w.WriteHeader(http.StatusInternalServerError)
+		tx.Rollback()
+		recordWrite(time.Since(start))
 		return
 	}
 
 	if err := tx.Commit(); err != nil {
-		http.Error(w, "Commit failed", http.StatusInternalServerError)
+		w.WriteHeader(http.StatusInternalServerError)
+		recordWrite(time.Since(start))
 		return
 	}
 
-	atomic.AddUint64(&writeCount, 1)
-
-	// Invalidate product cache
-	cacheKey := fmt.Sprintf("product:%d", req.ProductID)
-	rc.Del(ctx, cacheKey)
-
+	recordWrite(time.Since(start))
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"order_id": orderID,
-	})
+	fmt.Fprintf(w, `{"order_id":%d}`, orderID)
 }
 
 func handleMetrics(w http.ResponseWriter, r *http.Request) {
-	reads := atomic.LoadUint64(&readCount)
-	writes := atomic.LoadUint64(&writeCount)
-	hits := atomic.LoadUint64(&cacheHits)
-	misses := atomic.LoadUint64(&cacheMisses)
-
-	hitRate := float64(0)
-	if hits+misses > 0 {
-		hitRate = float64(hits) / float64(hits+misses) * 100
-	}
+	reads := atomic.LoadUint64(&metrics.readOps)
+	writes := atomic.LoadUint64(&metrics.writeOps)
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"reads":      reads,
-		"writes":     writes,
-		"cache_hits": hits,
-		"cache_misses": misses,
-		"cache_hit_rate": fmt.Sprintf("%.2f%%", hitRate),
-	})
+	fmt.Fprintf(w, `{
+  "reads": %d,
+  "writes": %d,
+  "read_latency_ms": {
+    "<10": %d,
+    "<50": %d,
+    "<100": %d,
+    "<500": %d,
+    ">=500": %d
+  },
+  "write_latency_ms": {
+    "<10": %d,
+    "<50": %d,
+    "<100": %d,
+    "<500": %d,
+    ">=500": %d
+  }
+}`, reads, writes,
+		atomic.LoadUint64(&metrics.readLatency[0]),
+		atomic.LoadUint64(&metrics.readLatency[1]),
+		atomic.LoadUint64(&metrics.readLatency[2]),
+		atomic.LoadUint64(&metrics.readLatency[3]),
+		atomic.LoadUint64(&metrics.readLatency[4]),
+		atomic.LoadUint64(&metrics.writeLatency[0]),
+		atomic.LoadUint64(&metrics.writeLatency[1]),
+		atomic.LoadUint64(&metrics.writeLatency[2]),
+		atomic.LoadUint64(&metrics.writeLatency[3]),
+		atomic.LoadUint64(&metrics.writeLatency[4]),
+	)
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("ok"))
+	fmt.Fprint(w, "ok")
 }
 
-func recordLatency(d time.Duration) {
+func recordRead(d time.Duration) {
+	atomic.AddUint64(&metrics.readOps, 1)
+	recordLatency(d, &metrics.readLatency)
+}
+
+func recordWrite(d time.Duration) {
+	atomic.AddUint64(&metrics.writeOps, 1)
+	recordLatency(d, &metrics.writeLatency)
+}
+
+func recordLatency(d time.Duration, buckets *[5]uint64) {
 	ms := d.Milliseconds()
-	idx := 0
-	if ms > 10000 {
-		idx = 9
-	} else if ms > 5000 {
-		idx = 8
-	} else if ms > 1000 {
-		idx = 7
-	} else if ms > 500 {
-		idx = 6
-	} else if ms > 100 {
-		idx = 5
-	} else if ms > 50 {
-		idx = 4
-	} else if ms > 10 {
-		idx = 3
-	} else if ms > 1 {
-		idx = 2
-	} else if ms > 0 {
+	idx := 4
+	if ms < 10 {
+		idx = 0
+	} else if ms < 50 {
 		idx = 1
+	} else if ms < 100 {
+		idx = 2
+	} else if ms < 500 {
+		idx = 3
 	}
-	atomic.AddUint64(&latencyBuckets[idx], 1)
+	atomic.AddUint64(&buckets[idx], 1)
 }

@@ -1,87 +1,149 @@
 # FlashSale: Learning Databases at Million-RPS Scale
 
-A progressive curriculum for learning real database architecture by building a flash sale backend that handles millions of requests per second.
+A hands-on curriculum for understanding real database bottlenecks through progressive building and breaking.
+
+Each phase follows the same loop: **build minimal code → load test → hit a bottleneck → understand why → fix it → move on**
 
 ## P0: Single-Node Baseline (Current)
 
-**Goal:** Measure the absolute ceiling of one Postgres + Redis node, understand connection pooling and indexing, identify the first bottleneck.
+**Before you code anything, read [P0_GUIDE.md](P0_GUIDE.md).**
 
-### What's Here
+**TL;DR:** You run load tests and deliberately break the system to see:
+- What happens when connections are exhausted
+- How locks serialize writes
+- Why indexes matter
+- Where the single-node ceiling is
 
-- **main.go** – Dead-simple Go HTTP server with two endpoints:
-  - `GET /catalog/product?id=N` – Read from cache, fallback to DB (cache-aside pattern)
-  - `POST /orders` – Write order with inventory check (transaction with FOR UPDATE)
-  - `GET /metrics` – Basic counters
-  
-- **Stack:**
-  - Postgres 15 (no fancy replication yet)
-  - Redis 7 (basic cache)
-  - k6 (load testing)
-  - Prometheus + Grafana (metrics, optional)
-
-- **load_test_p0.js** – Ramps up 100 concurrent users, measures latency/throughput
-
-### Key Concepts in P0
-
-1. **Connection Pooling**: The app limits Postgres to 100 open connections. If you remove `SetMaxOpenConns`, watch latency explode as Postgres refuses new connections.
-
-2. **Indexes**: Product queries scan the index `idx_products_id`. Try removing it and re-running the load test; latency will tank.
-
-3. **Cache-Aside Pattern**: `GET /catalog/product` tries Redis first. On miss, it hits the DB and backfills the cache. Watch cache hit rate climb.
-
-4. **Transactions with Locking**: `POST /orders` uses `FOR UPDATE` to lock the product row while checking stock. This prevents overselling but creates contention at high load.
-
-5. **WAL & Durability**: Every order write goes through Postgres's Write-Ahead Log. Async vs sync replication will matter in P6.
-
-### Running P0
-
-**Setup:**
+Start:
 ```bash
-docker-compose up -d          # Start Postgres, Redis, Prometheus
-go build -o flashsale .
-./flashsale
+docker-compose up -d
+go run .
 ```
 
-**Load test:**
+Load test (another terminal):
 ```bash
-# Terminal 2
-k6 run --vus 50 --duration 60s load_test_p0.js
+k6 run load_test_p0.js
 ```
 
-**Observe:**
-- Terminal 1: Watch app logs for connection/query errors
-- Terminal 2: k6 shows p95/p99 latencies and throughput
-- `curl http://localhost:8080/metrics` – See cache hit rate, read/write counts
+Watch metrics:
+```bash
+while true; do curl -s http://localhost:8080/metrics | jq '{reads: .reads, writes: .writes, write_p99: .write_latency_ms.">=500"}'; sleep 1; done
+```
 
-### What You'll See
+Then follow the experiments in P0_GUIDE.md. You should break things and understand why.
 
-- **Cache hit rate:** Should climb from 0% to ~95% as hot products get cached
-- **Latency at 50 VUs:** Reads ≈ 5-20ms (cache), ≈ 50-100ms (DB). Writes ≈ 200-500ms (locks).
-- **RPS ceiling:** ~5-10k RPS before latency blows up (limited by single DB node)
+---
 
-### What to Measure
+## Phases
 
-Before moving to P1, run the load test and capture:
-- **Peak reads RPS** (until p99 > 1s)
-- **Peak writes RPS** (until p99 > 1s)
-- **Cache hit ratio** at peak
-- **CPU/memory usage** (watch Docker)
+- **P0** – Single node: connection pooling, indexing, FOR UPDATE locks
+- **P1** – Read replicas + cache-aside: replication lag, cache stampedes, request coalescing
+- **P2** – Hot-row inventory: stock bucketing, Redis Lua scripts
+- **P3** – Sharding orders: consistent hashing, scatter-gather, online resharding
+- **P4** – Write-heavy counters: batch flushing, LSM vs B-tree
+- **P5** – Cross-shard txns: outbox pattern, sagas, idempotency
+- **P6** – Failover & ops: Patroni, chaos tests, backups
 
-If you remove the cache (`// rc.Set(...)`), re-run and see how read throughput tanks.
+Each phase is a git branch. Each includes:
+- Minimal code (no framework noise)
+- Explicit metrics showing the problem
+- Load test scenarios
+- A guide explaining what to learn
 
-### Key Code to Study
+---
 
-- **Cache pattern**: `handleGetProduct()` – Try/catch Redis, fallback to DB, backfill
-- **Locking**: `handleCreateOrder()` – `FOR UPDATE` prevents lost updates
-- **Metrics**: `atomic.AddUint64()` – Lock-free counters for high-frequency updates
-- **Latency tracking**: `recordLatency()` – Simple bucket histogram
+## The Stack
 
-### Next: P1 – Scaling Reads
+- **Language:** Go (no boilerplate, easy to see DB patterns)
+- **Database:** Postgres 15
+- **Cache:** Redis 7
+- **Load testing:** k6
+- **Monitoring:** Prometheus + Grafana (optional)
+- **Docker:** docker-compose keeps it self-contained
 
-P1 adds read replicas and fixes cache stampedes (key expires under load → all traffic slams DB). You'll learn:
-- Replication lag issues (reading before write propagates)
-- Cache invalidation strategies
-- Singleflight / request coalescing
+---
+
+## Not Here
+
+- Spring Boot / Django / Express boilerplate
+- ORM magic (you write SQL so you see what's happening)
+- Canned solutions (you experiment and learn)
+
+---
+
+## Running It
+
+```bash
+# Setup
+docker-compose up -d
+go mod download
+
+# Run server
+go run .
+
+# Load test (new terminal)
+k6 run load_test_p0.js
+
+# Watch metrics (new terminal)
+curl http://localhost:8080/metrics
+
+# Teardown
+docker-compose down -v
+```
+
+---
+
+## What You'll Learn
+
+By the end, you'll have hands-on experience with:
+
+**Postgres:**
+- Connection pooling, resource limits
+- Indexes and query planning (`EXPLAIN ANALYZE`)
+- Transactions, isolation levels, locking (SELECT ... FOR UPDATE)
+- Replication (sync vs async), failover (Patroni)
+- Write-Ahead Log (WAL), durability, async commit
+
+**Caching & Consistency:**
+- Cache-aside pattern, TTL, stampedes
 - Stale-while-revalidate
+- Cache invalidation via CDC
+- Request coalescing (singleflight)
 
-When ready, `git commit` your P0 measurements and branch for P1.
+**Scaling:**
+- Read replicas, lag
+- Sharding: key selection, consistent hashing, hot shards
+- Scatter-gather queries
+- Online resharding (no downtime)
+
+**High-Load Patterns:**
+- Hot-row solutions (bucketing, Lua scripts, async reconcile)
+- Write coalescing (batch updates)
+- Outbox pattern, sagas
+- Idempotency keys
+- Load shedding
+
+---
+
+## Why This Approach?
+
+Most tutorials teach databases in isolation. "Here's a cache", "here's sharding". But in reality:
+
+- Caching breaks consistency
+- Sharding breaks transactions
+- Locks serialize everything
+- Replicas lag
+
+This curriculum shows you **all the tradeoffs at once**, through hands-on experiments. You see the problem before the solution. That's how you build intuition.
+
+---
+
+## Getting Started
+
+1. Read [P0_GUIDE.md](P0_GUIDE.md) — it explains what to measure and what experiments to run
+2. Start the stack: `docker-compose up -d`
+3. Run the server: `go run .`
+4. Run the load test: `k6 run load_test_p0.js`
+5. Try the experiments (remove locks, drop indexes, shrink pool)
+6. Understand what broke and why
+7. When ready, move to P1
