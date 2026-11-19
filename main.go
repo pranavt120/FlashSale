@@ -9,51 +9,85 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	_ "github.com/lib/pq"
+	"golang.org/x/sync/singleflight"
 )
 
-var db *sql.DB
+var (
+	dbMaster   *sql.DB // Write endpoint
+	dbReplica  *sql.DB // Read endpoint
+	redisClient *redis.Client
+	sfGroup     singleflight.Group // Request coalescing for cache misses
+)
 
 type Metrics struct {
-	// Reads
-	readOps     uint64
-	readLatency [5]uint64 // <10ms, <50ms, <100ms, <500ms, >=500ms
+	readOps       uint64
+	readLatency   [5]uint64 // <10ms, <50ms, <100ms, <500ms, >=500ms
+	cacheHits     uint64
+	cacheMisses   uint64
+	cacheStamps   uint64
+	replicaLag    int64 // milliseconds
 
-	// Writes
-	writeOps     uint64
-	writeLatency [5]uint64
+	writeOps      uint64
+	writeLatency  [5]uint64
 }
 
 var metrics Metrics
 
 func main() {
-	// Connect to Postgres
+	// Master: writes only (port 5432)
 	dsn := "user=postgres password=postgres dbname=flashsale host=localhost port=5432 sslmode=disable"
 	var err error
-	db, err = sql.Open("postgres", dsn)
+	dbMaster, err = sql.Open("postgres", dsn)
 	if err != nil {
-		log.Fatalf("Open failed: %v", err)
+		log.Fatalf("Master open failed: %v", err)
 	}
-	defer db.Close()
+	defer dbMaster.Close()
+	dbMaster.SetMaxOpenConns(50)
+	dbMaster.SetMaxIdleConns(5)
+	dbMaster.SetConnMaxLifetime(time.Minute)
 
-	// Connection pool tuning - this is the FIRST bottleneck you'll hit
-	db.SetMaxOpenConns(50)  // Experiment: try 10, then 100, see latency change
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(time.Minute)
+	// Replica: reads only (port 5433)
+	dsn = "user=postgres password=postgres dbname=flashsale host=localhost port=5433 sslmode=disable"
+	dbReplica, err = sql.Open("postgres", dsn)
+	if err != nil {
+		log.Fatalf("Replica open failed: %v", err)
+	}
+	defer dbReplica.Close()
+	dbReplica.SetMaxOpenConns(50)
+	dbReplica.SetMaxIdleConns(5)
+	dbReplica.SetConnMaxLifetime(time.Minute)
 
-	if err := db.Ping(); err != nil {
-		log.Fatalf("Ping failed: %v", err)
+	// Redis cache (60s TTL)
+	redisClient = redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+	})
+	defer redisClient.Close()
+
+	if err := redisClient.Ping(context.Background()).Err(); err != nil {
+		log.Fatalf("Redis ping failed: %v", err)
 	}
 
-	// Initialize schema + seed data
+	if err := dbMaster.Ping(); err != nil {
+		log.Fatalf("Master ping failed: %v", err)
+	}
+
+	if err := dbReplica.Ping(); err != nil {
+		log.Fatalf("Replica ping failed: %v", err)
+	}
+
+	// Initialize schema on master only
 	if err := initDB(); err != nil {
 		log.Fatalf("Init failed: %v", err)
 	}
-	log.Printf("✓ DB ready (pool: max_open=50, max_idle=5)")
+	log.Printf("✓ Master ready (port 5432, pool: 50)")
+	log.Printf("✓ Replica ready (port 5433, pool: 50)")
+	log.Printf("✓ Redis ready (localhost:6379)")
 
 	// Handlers
-	http.HandleFunc("/product", handleProduct)      // Read one product
-	http.HandleFunc("/order", handleOrder)          // Write one order (locks inventory)
+	http.HandleFunc("/product", handleProduct)      // Read from cache/replica
+	http.HandleFunc("/order", handleOrder)          // Write to master, invalidate cache
 	http.HandleFunc("/metrics", handleMetrics)      // Live metrics
 	http.HandleFunc("/", handleHealth)
 
@@ -62,6 +96,7 @@ func main() {
 }
 
 func initDB() error {
+	// Schema only created on master; replica gets it via replication
 	schema := `
 	CREATE TABLE IF NOT EXISTS products (
 		id SERIAL PRIMARY KEY,
@@ -79,23 +114,23 @@ func initDB() error {
 	);
 	`
 
-	if _, err := db.Exec(schema); err != nil {
+	if _, err := dbMaster.Exec(schema); err != nil {
 		return err
 	}
 
-	// Seed 10 products (only if they don't exist)
+	// Seed products on master
 	for i := 1; i <= 10; i++ {
 		var exists bool
-		db.QueryRow("SELECT EXISTS(SELECT 1 FROM products WHERE id = $1)", i).Scan(&exists)
+		dbMaster.QueryRow("SELECT EXISTS(SELECT 1 FROM products WHERE id = $1)", i).Scan(&exists)
 		if exists {
 			continue
 		}
 
 		stock := 1000
 		if i == 1 {
-			stock = 1000000 // Hot SKU - set high to see lock contention
+			stock = 1000000 // Hot SKU
 		}
-		_, err := db.Exec("INSERT INTO products (id, name, stock) VALUES ($1, $2, $3)", i, fmt.Sprintf("Product %d", i), stock)
+		_, err := dbMaster.Exec("INSERT INTO products (id, name, stock) VALUES ($1, $2, $3)", i, fmt.Sprintf("Product %d", i), stock)
 		if err != nil {
 			return err
 		}
@@ -104,56 +139,97 @@ func initDB() error {
 	return nil
 }
 
-// Read a product (no cache)
+// handleProduct: cache-aside pattern
+// 1. Check Redis cache
+// 2. On miss, use singleflight to coalesce requests
+// 3. Query replica (read-only, behind master)
+// 4. Update cache with 60s TTL
 func handleProduct(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
 	id := r.URL.Query().Get("id")
 	if id == "" {
-		id = "1" // Default to hot SKU
+		id = "1"
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), time.Second)
-	defer cancel()
+	// Try cache first
+	cacheKey := fmt.Sprintf("product:%s", id)
+	cached, err := redisClient.Get(context.Background(), cacheKey).Result()
+	if err == nil {
+		// Cache hit
+		atomic.AddUint64(&metrics.cacheHits, 1)
+		recordRead(time.Since(start))
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Cache", "HIT")
+		fmt.Fprint(w, cached)
+		return
+	}
 
-	var stock int
-	err := db.QueryRowContext(ctx, "SELECT stock FROM products WHERE id = $1", id).Scan(&stock)
+	// Cache miss: use singleflight to coalesce requests for same key
+	// If 10 requests come in simultaneously for key "1", only 1 hits DB
+	val, err, shared := sfGroup.Do(cacheKey, func() (interface{}, error) {
+		atomic.AddUint64(&metrics.cacheMisses, 1)
+
+		ctx, cancel := context.WithTimeout(r.Context(), time.Second)
+		defer cancel()
+
+		var stock int
+		err := dbReplica.QueryRowContext(ctx, "SELECT stock FROM products WHERE id = $1", id).Scan(&stock)
+		if err != nil {
+			return nil, err
+		}
+
+		result := fmt.Sprintf(`{"id":%s,"stock":%d}`, id, stock)
+
+		// Update cache with 60s TTL
+		redisClient.Set(context.Background(), cacheKey, result, 60*time.Second)
+
+		return result, nil
+	})
+
+	// shared=true means other requests were coalesced (cache stampede mitigation)
+	if shared {
+		atomic.AddUint64(&metrics.cacheStamps, 1)
+	}
+
 	if err != nil {
+		recordRead(time.Since(start))
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
 	recordRead(time.Since(start))
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"id":%s,"stock":%d}`, id, stock)
+	w.Header().Set("X-Cache", "MISS")
+	fmt.Fprint(w, val.(string))
 }
 
-// Write an order with inventory lock (FOR UPDATE)
-// This is where you'll see lock contention at high load
+// handleOrder: write to master, invalidate cache
 func handleOrder(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
 	id := r.URL.Query().Get("id")
 	if id == "" {
-		id = "1" // Default hits hot SKU
+		id = "1"
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
 
-	tx, err := db.BeginTx(ctx, nil)
+	tx, err := dbMaster.BeginTx(ctx, nil)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
+		recordWrite(time.Since(start))
 		return
 	}
 	defer tx.Rollback()
 
-	// FOR UPDATE locks the row: only one transaction can hold this lock
-	// At 1000 RPS, all threads queue here waiting for the lock
+	// FOR UPDATE lock on master
 	var currentStock int
 	err = tx.QueryRowContext(ctx, "SELECT stock FROM products WHERE id = $1 FOR UPDATE", id).Scan(&currentStock)
 	if err != nil {
 		w.WriteHeader(http.StatusNotFound)
+		recordWrite(time.Since(start))
 		return
 	}
 
@@ -169,7 +245,6 @@ func handleOrder(w http.ResponseWriter, r *http.Request) {
 	_, err = tx.ExecContext(ctx, "UPDATE products SET stock = stock - 1 WHERE id = $1", id)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		tx.Rollback()
 		recordWrite(time.Since(start))
 		return
 	}
@@ -179,7 +254,6 @@ func handleOrder(w http.ResponseWriter, r *http.Request) {
 	_, err = tx.ExecContext(ctx, "INSERT INTO orders (id, product_id, quantity) VALUES ($1, $2, 1)", orderID, id)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		tx.Rollback()
 		recordWrite(time.Since(start))
 		return
 	}
@@ -190,6 +264,10 @@ func handleOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Invalidate cache for this product (write hits master, invalidate immediately)
+	cacheKey := fmt.Sprintf("product:%s", id)
+	redisClient.Del(context.Background(), cacheKey)
+
 	recordWrite(time.Since(start))
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, `{"order_id":%d}`, orderID)
@@ -198,11 +276,23 @@ func handleOrder(w http.ResponseWriter, r *http.Request) {
 func handleMetrics(w http.ResponseWriter, r *http.Request) {
 	reads := atomic.LoadUint64(&metrics.readOps)
 	writes := atomic.LoadUint64(&metrics.writeOps)
+	cacheHits := atomic.LoadUint64(&metrics.cacheHits)
+	cacheMisses := atomic.LoadUint64(&metrics.cacheMisses)
+	cacheStamps := atomic.LoadUint64(&metrics.cacheStamps)
+
+	cacheHitRate := 0.0
+	if totalReads := cacheHits + cacheMisses; totalReads > 0 {
+		cacheHitRate = float64(cacheHits) / float64(totalReads) * 100
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, `{
   "reads": %d,
   "writes": %d,
+  "cache_hits": %d,
+  "cache_misses": %d,
+  "cache_stampedes": %d,
+  "cache_hit_rate_pct": %.2f,
   "read_latency_ms": {
     "<10": %d,
     "<50": %d,
@@ -217,7 +307,7 @@ func handleMetrics(w http.ResponseWriter, r *http.Request) {
     "<500": %d,
     ">=500": %d
   }
-}`, reads, writes,
+}`, reads, writes, cacheHits, cacheMisses, cacheStamps, cacheHitRate,
 		atomic.LoadUint64(&metrics.readLatency[0]),
 		atomic.LoadUint64(&metrics.readLatency[1]),
 		atomic.LoadUint64(&metrics.readLatency[2]),

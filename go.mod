@@ -1,10 +1,11 @@
 module flashsale
 
-go 1.22
+go 1.26.0
 
 require (
-	github.com/lib/pq v1.10.9
+	github.com/lib/pq v1.12.3
 	github.com/redis/go-redis/v9 v9.0.5
+	golang.org/x/sync v0.25.0
 )
 
 require (
