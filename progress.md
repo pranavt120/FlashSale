@@ -185,6 +185,99 @@ Master (port 5432) → Replica (port 5433)
    dbReplica.Query(selectStmt)  // Reads only
    ```
 
+### What's NOT Solved Yet (P1)
+
+- ❌ **Write scaling** – All writes still hit single master (bottleneck remains)
+- ❌ **Connection pool** – Still 50 max (fine for 1000s RPS but not millions)
+- ❌ **Sharding** – All traffic to one master/replica pair
+- ❌ **Multi-shard transactions** – Cross-shard consistency
+- ❌ **Failover & ops** – No automated recovery, monitoring limited
+- ❌ **Replication lag detection** – Writes may be read before replica catches up
+- ❌ **Cache consistency** – No distributed invalidation (CDCs, pub/sub)
+
+### Fixes Applied During Setup
+
+| Issue | Fix |
+|-------|-----|
+| Invalid volume mount | Changed `./init:docker-entrypoint-initdb.d` → `./init:/docker-entrypoint-initdb.d` |
+| Replica hostname mismatch | Fixed `postgres-primary` → `postgres-master` in init script |
+| Replication auth failure | Added replicator user to pg_hba.conf |
+| Replica not listening on network | Added `listen_addresses = '*'` to replica config |
+| k6 script error | Removed invalid `res.tags` assignment |
+
+---
+
+## P2: Write Scaling (Planned)
+
+### Hypothesis
+
+Write bottleneck in P1: all 30% of traffic (writes) still serializes on master's FOR UPDATE lock. Solution: **multi-shard write** with consistent hashing.
+
+### Approach
+
+1. **Sharding layer** – Route writes to shard based on product_id hash
+2. **Multiple masters** – Shard 1 master + 1 replica per shard (e.g., 4 shards = 8 DBs)
+3. **Local locks** – FOR UPDATE lock per shard, not global
+4. **Cross-shard reads** – Scatter/gather from replicas
+
+### Expected Results
+
+- Write latency: 257ms → <100ms (less lock contention per shard)
+- Overall RPS: 1,245 → 3,000+ (2.4x with 4 shards)
+- Read p95: 2.4ms → 5ms (scatter/gather overhead)
+- Write success: 100% → 99%+ (handle shard failover gracefully)
+
+### New Issues to Discover
+
+1. **Shard rebalancing** – How to move product to new shard?
+2. **Hot shards** – If all writes go to shard 1 (bad hash function)
+3. **Join queries** – Can't efficiently read across shards
+4. **Transactions** – 2PC or saga pattern for multi-shard writes?
+
+---
+
+## Running the System
+
+### Quick Start
+
+```bash
+# Start all services (Docker Compose)
+docker compose up -d
+
+# Run the app
+go run main.go
+
+# Run load test
+k6 run load_test_p1.js
+```
+
+### Live Services
+
+| Service | Port | Purpose |
+|---------|------|---------|
+| **App** | 8080 | HTTP API (`/product`, `/order`, `/metrics`) |
+| **Master DB** | 5432 | Write endpoint (Postgres 16) |
+| **Replica DB** | 5433 | Read endpoint (read-only standby) |
+| **Redis** | 6379 | Cache layer (60s TTL) |
+| **Prometheus** | 9090 | Metrics collection |
+| **Grafana** | 3000 | Dashboards (admin/admin) |
+
+### API Endpoints
+
+```bash
+# Health check
+curl http://localhost:8080/
+
+# Read product stock (cached, hits replica on miss)
+curl http://localhost:8080/product?id=1
+
+# Buy product (write, hits master, invalidates cache)
+curl http://localhost:8080/order?id=1
+
+# View metrics
+curl http://localhost:8080/metrics | jq
+```
+
 ---
 
 ## Technical Debt / Notes
@@ -193,6 +286,8 @@ Master (port 5432) → Replica (port 5433)
 - Stock for product 1 manually reset to 1M between test runs
 - Need to automate baseline capture (JSON metrics endpoint works, could parse)
 - k6 metrics tagged by `type:read` / `type:write` (helps isolate problems)
+- Replication lag not currently monitored (should track LSN drift)
+- Cache TTL is fixed at 60s (should be configurable)
 
 ---
 
@@ -213,5 +308,36 @@ Master (port 5432) → Replica (port 5433)
 
 ## Commit History
 
-- `77a2f01` – P0 baseline (rewritten for hands-on learning)
-- Next: P1 with replicas + cache-aside
+| Commit | Message |
+|--------|---------|
+| `77a2f01` | P0: Rewritten for hands-on learning, not boilerplate |
+| `a7357f3` | P0: Complete with baseline metrics and progress tracking |
+| `2e33685` | P1: Fix Docker Compose and database replication setup |
+| `b110597` | P1: Mark complete with final load test results |
+
+---
+
+## Learning Outcomes
+
+### P0 → P1 Improvements
+
+**Problem identified:** Single master + 50 connection pool = 1000 RPS ceiling
+
+**Solution space explored:**
+1. Read replicas (removes read lock contention) ✓ Implemented
+2. Cache-aside (99%+ hit rate on hot keys) ✓ Implemented
+3. Singleflight (coalesce cache misses) ✓ Implemented
+
+**Result:** 1,245 RPS, 100x faster cache reads
+
+### Key Insight
+
+> Write latency didn't improve much (257ms avg vs 209ms) because the master still has the same lock contention. **The bottleneck moved from reads to writes.** P1 solved the read scaling problem; P2 must solve writes.
+
+### What's Different About This Approach
+
+- **Learn by doing** – Build incrementally, measure at each step
+- **Real load testing** – Not guessing performance; run k6 with realistic 200 VUs
+- **Visible bottleneck** – Each phase shows *why* we hit a ceiling (metrics + latency buckets)
+- **Production patterns** – Master-replica, cache-aside, singleflight are real techniques
+- **Small codebase** – ~350 lines Go, easy to understand all layers
